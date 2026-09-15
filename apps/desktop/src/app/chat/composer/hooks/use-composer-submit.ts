@@ -10,6 +10,7 @@ import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-qu
 import { hasMcpSetupRequest, skipMcpSetupRequest } from '@/store/mcp-setup'
 import { hasBlockingPromptRequest } from '@/store/prompts'
 
+import type { BusyInputMode } from '../busy-input-mode'
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
 import { pathifyRefs } from '../path-refs'
@@ -22,6 +23,7 @@ interface UseComposerSubmitArgs {
   activeQueueSessionKeyRef: RefObject<string | null>
   attachments: ComposerAttachment[]
   busy: boolean
+  busyInputMode: BusyInputMode
   compacting: boolean
   clearDraft: () => void
   disabled: boolean
@@ -49,15 +51,17 @@ interface UseComposerSubmitArgs {
  * queue meet. `submitDraft` is the one decision tree (queue-edit save · slash-
  * now-while-busy · queue · drain · send · stop); `dispatchSubmit` is the shared
  * send-with-restore primitive (re-loads + re-stashes the draft if the gateway
- * rejects, so nothing is ever lost); `steerDraft` redirects the live turn. Reads
- * the draft + queue APIs; owns no state of its own beyond the stable
- * external-submit listener ref.
+ * rejects, so nothing is ever lost); `steerDraft` is the interrupt/redirect
+ * path. `display.busy_input_mode` chooses redirect, tool-boundary steer, or
+ * queue. Reads the draft + queue APIs; owns no state of its own beyond the
+ * stable external-submit listener ref.
  */
 export function useComposerSubmit({
   activeQueueSessionKey,
   activeQueueSessionKeyRef,
   attachments,
   busy,
+  busyInputMode,
   compacting,
   clearDraft,
   disabled,
@@ -122,8 +126,8 @@ export function useComposerSubmit({
   // if the turn has already ended, or a steer is not possible, queue it so it
   // runs next. This holds for hidden setup notes and for visible messages a
   // button sends on the user's behalf alike.
-  const externalSubmitRef = useRef({ busy, compacting, dispatchSubmit, onSteer, onSteerHidden })
-  externalSubmitRef.current = { busy, compacting, dispatchSubmit, onSteer, onSteerHidden }
+  const externalSubmitRef = useRef({ busy, busyInputMode, compacting, dispatchSubmit, onSteer, onSteerHidden })
+  externalSubmitRef.current = { busy, busyInputMode, compacting, dispatchSubmit, onSteer, onSteerHidden }
 
   useLayoutEffect(
     () =>
@@ -167,13 +171,27 @@ export function useComposerSubmit({
             return
           }
 
-          if (
-            current.onSteer &&
+          const canCorrect =
             !current.compacting &&
             !hasBlockingPromptRequest(sessionId) &&
-            text.trim() &&
+            Boolean(text.trim()) &&
             !SLASH_COMMAND_RE.test(text.trim())
-          ) {
+
+          if (current.busyInputMode === 'queue' || !canCorrect) {
+            enqueue()
+          } else if (current.busyInputMode === 'steer') {
+            if (current.onSteerHidden) {
+              void Promise.resolve(current.onSteerHidden(text))
+                .then(accepted => {
+                  if (!accepted) {
+                    enqueue()
+                  }
+                })
+                .catch(enqueue)
+            } else {
+              enqueue()
+            }
+          } else if (current.onSteer) {
             void Promise.resolve(current.onSteer(text))
               .then(accepted => {
                 if (!accepted) {
@@ -188,6 +206,50 @@ export function useComposerSubmit({
       }),
     [activeQueueSessionKeyRef, inputDisabled, paneVisible, scope.target, sessionId, surfaceId]
   )
+
+  const queueFallback = (text: string) => {
+    if (activeQueueSessionKey) {
+      enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+    }
+  }
+
+  const steerDraft = () => {
+    const text = draftRef.current.trim()
+
+    // Guard on live editor state, not the render-lagged `canSteer`: a redirect
+    // fired on a fast Enter must not be dropped because state hasn't synced.
+    if (!onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
+      return
+    }
+
+    triggerHaptic('submit')
+    clearDraft()
+
+    void Promise.resolve(onSteer(text)).then(accepted => {
+      if (!accepted) {
+        queueFallback(text)
+      }
+    })
+  }
+
+  const toolSteerDraft = () => {
+    const text = draftRef.current.trim()
+
+    if (!onSteerHidden || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
+      queueCurrentDraft()
+
+      return
+    }
+
+    triggerHaptic('submit')
+    clearDraft()
+
+    void Promise.resolve(onSteerHidden(text)).then(accepted => {
+      if (!accepted) {
+        queueFallback(text)
+      }
+    })
+  }
 
   const submitDraft = () => {
     if (disabled) {
@@ -264,10 +326,15 @@ export function useComposerSubmit({
         clearDraft()
         dispatchSubmit(text)
       } else if (!compacting && !blockingPrompt && !attachments.length && text.trim()) {
-        // Cursor-style stop-and-correct: interrupt the live turn and redirect
-        // it with this text. redirect() preserves the shown reasoning/work; if
-        // the turn already ended, steerDraft re-queues so nothing is lost.
-        steerDraft()
+        if (busyInputMode === 'queue') {
+          queueCurrentDraft()
+        } else if (busyInputMode === 'steer') {
+          // Tool-boundary inject (`session.steer`): no cancel, no new turn.
+          toolSteerDraft()
+        } else {
+          // interrupt (default): Cursor-style redirect of the live turn.
+          steerDraft()
+        }
       } else if (payloadPresent) {
         // Attachments can't ride a redirect (no tool-result image carriage) —
         // queue the whole payload for the next turn. Same for a turn parked on
@@ -292,28 +359,6 @@ export function useComposerSubmit({
     }
 
     focusInput()
-  }
-
-  // Redirect the live turn with a correction. The gateway either restarts the
-  // active model request with its displayed context or waits for the current
-  // tool boundary. If the turn already ended, queue the words instead.
-  const steerDraft = () => {
-    const text = draftRef.current.trim()
-
-    // Guard on live editor state, not the render-lagged `canSteer`: a redirect
-    // fired on a fast Enter must not be dropped because state hasn't synced.
-    if (!onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
-      return
-    }
-
-    triggerHaptic('submit')
-    clearDraft()
-
-    void Promise.resolve(onSteer(text)).then(accepted => {
-      if (!accepted && activeQueueSessionKey) {
-        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
-      }
-    })
   }
 
   const queueDraft = () => {

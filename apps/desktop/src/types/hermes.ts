@@ -411,6 +411,7 @@ export interface HermesConfig {
     skin?: string
     interim_assistant_messages?: boolean
     timestamps?: boolean
+    busy_input_mode?: 'interrupt' | 'queue' | 'steer'
   }
   desktop?: {
     repo_scan_enabled?: boolean

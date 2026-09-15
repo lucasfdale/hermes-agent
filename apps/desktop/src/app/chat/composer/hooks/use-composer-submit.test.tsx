@@ -23,6 +23,7 @@ import { useComposerSubmit } from './use-composer-submit'
 interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
+  busyInputMode?: 'interrupt' | 'queue' | 'steer'
   compacting?: boolean
   inputDisabled?: boolean
   scopeTarget?: ComposerTarget
@@ -38,6 +39,7 @@ let surfaceSequence = 0
 function renderSubmitHook({
   attachments = [],
   busy = false,
+  busyInputMode = 'interrupt',
   compacting = false,
   inputDisabled = false,
   scopeTarget = 'main',
@@ -101,6 +103,7 @@ function renderSubmitHook({
         activeQueueSessionKeyRef: { current: sessionKey },
         attachments,
         busy,
+        busyInputMode,
         compacting,
         clearDraft,
         disabled: false,
@@ -355,6 +358,42 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('injects via session.steer when busy_input_mode is steer', async () => {
+    const { hook, onCancel, onSteer, onSteerHidden, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      busyInputMode: 'steer',
+      text: 'focus on auth'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSteerHidden).toHaveBeenCalledWith('focus on auth'))
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('queues a follow-up when busy_input_mode is queue', () => {
+    const { hook, onCancel, onSteer, onSteerHidden, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      busyInputMode: 'queue',
+      text: 'after this finishes'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSteerHidden).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
   })
 
   it('queues a plain-text follow-up while the active turn is compacting', () => {

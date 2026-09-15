@@ -3,6 +3,7 @@ import { useStore } from '@nanostores/react'
 import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { useTourMarker } from '@/app/chat/tour-marker'
+import { useHermesConfigRecord } from '@/app/hooks/use-config-record'
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
 import { composerFill, composerFloatingStrip, composerSurfaceGlass } from '@/components/chat/composer-dock'
 import { $chatOnboardingSolo, $chatOnboardingThreadIds } from '@/components/onboarding-chat/assembly'
@@ -33,6 +34,7 @@ import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
 
 import { AttachmentList } from './attachments'
+import { normalizeBusyInputMode, resolveBusyComposerAction } from './busy-input-mode'
 import {
   acceptsTriggerCompletion,
   COMPOSER_FADE_BACKGROUND,
@@ -124,6 +126,12 @@ export function ChatBar({
   onTranscribeAudio
 }: ChatBarProps) {
   const hudMode = useStore($hudMode)
+  const { data: configRecord } = useHermesConfigRecord()
+
+  const busyInputMode = normalizeBusyInputMode(
+    (configRecord as { display?: { busy_input_mode?: unknown } } | undefined)?.display?.busy_input_mode
+  )
+
   const hudWindowing = window.hermesDesktop?.hud?.windowing
   const hudNativeDrag = hudMode && hudWindowing?.nativeDrag === true
 
@@ -330,7 +338,7 @@ export function ChatBar({
     focusInput,
     loadIntoComposer,
     onCancel,
-    onSteer,
+    onSteer: busyInputMode === 'steer' ? onSteerHidden : onSteer,
     onSubmit,
     queueEditRef,
     queueSessionKey,
@@ -364,27 +372,29 @@ export function ChatBar({
   const hasComposerPayload = hasText || attachments.length > 0
   const canSubmit = busy || hasComposerPayload
 
-  // Steer only makes sense mid-turn, text-only (the gateway can't carry images
-  // into a tool result) and never for a slash command (those execute inline).
-  // A blocking prompt (approval/sudo/secret) also rules it out: the tool batch
-  // is parked on the user, so a steer can't reach the model — text queues.
-  const canSteer = busy && !compacting && !blockingPrompt && !!onSteer && attachments.length === 0 && isSteerableText
+  const canRedirect =
+    busy && !compacting && !blockingPrompt && !!onSteer && attachments.length === 0 && isSteerableText
 
-  // While busy: text redirects the live turn (Cursor-style stop-and-correct),
-  // attachments queue for the next turn, an empty composer stops.
-  const busyAction: 'steer' | 'queue' | 'stop' = canSteer
-    ? 'steer'
-    : compacting || hasComposerPayload
-      ? 'queue'
-      : 'stop'
+  const canToolSteer =
+    busy && !compacting && !blockingPrompt && !!onSteerHidden && attachments.length === 0 && isSteerableText
+
+  const busyAction = resolveBusyComposerAction({
+    busy,
+    canRedirect,
+    canSteer: canToolSteer,
+    compacting,
+    hasPayload: hasComposerPayload,
+    mode: busyInputMode
+  })
 
   // The submit engine — the orchestration seam where draft + queue meet. Owns
   // the submit decision tree, the send-with-restore primitive, and steer.
-  const { queueDraft, steerDraft, submitDraft } = useComposerSubmit({
+  const { queueDraft, submitDraft } = useComposerSubmit({
     activeQueueSessionKey,
     activeQueueSessionKeyRef,
     attachments,
     busy,
+    busyInputMode,
     compacting,
     clearDraft,
     disabled,
@@ -912,8 +922,8 @@ export function ChatBar({
       return
     }
 
-    // Cmd/Ctrl+Enter queues a follow-up while a turn runs. Plain Enter steers
-    // a text-only draft, so both live-turn actions stay reachable by keyboard.
+    // Cmd/Ctrl+Enter queues a follow-up while a turn runs. Plain Enter follows
+    // display.busy_input_mode (interrupt/redirect, steer, or queue).
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
       event.preventDefault()
 
