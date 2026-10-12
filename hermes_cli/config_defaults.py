@@ -2553,8 +2553,14 @@ DEFAULT_CONFIG = {
         "autostart": False,
         "native_wayland": False,
         # Cap driver screenshot longest edge (pixels) via set_config at session start; shrinks SOM
-        # multimodal payloads. 0 disables.
-        "max_image_dimension": 1456,
+        # multimodal payloads (a 1348x816 Calculator window: ~1,470 image tokens at 1456, ~850 at 1024).
+        # coordinate= clicks stay correct: the driver maps screenshot pixels back. 0 disables.
+        "max_image_dimension": 1024,
+        # Capture text shape. true = one compact row per element (`[12] Button Save (disabled)`, no
+        # bounds, no AX prefix), the app menu bar omitted unless capture(menus=true), capture_after
+        # follow-ups list only changed rows. false = the legacy JSON `elements` array + summary rows
+        # (element list sent twice). Recent-file submenus are never listed either way.
+        "compact_capture": True,
         # capture_after mode: som = screenshot + overlays; ax = elements only, no PNG (faster);
         # vision = pixels only.
         "capture_after_mode": "som",

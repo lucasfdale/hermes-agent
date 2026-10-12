@@ -44,10 +44,10 @@ _PROPERTIES: dict[str, Any] = {
         "type": "string",
         "enum": ["som", "vision", "ax"],
         "description": (
-            "Capture mode. `som` (default) is a screenshot with numbered overlays on every "
-            "interactable element plus the AX tree — best for vision models, lets you click by "
-            "element index. `vision` is a plain screenshot. `ax` is the accessibility tree only "
-            "(no image; useful for text-only models)."
+            "Capture mode. `som` (default) is a screenshot plus the element list; best for vision "
+            "models, lets you click by element index. `vision` is a plain screenshot. `ax` is the "
+            "element list only (no image; cheapest, enough when you only need to find and click "
+            "elements)."
         ),
     },
     "app": {
@@ -66,6 +66,13 @@ _PROPERTIES: dict[str, Any] = {
             "discovery cannot resolve an X11 app."
         ),
     },
+    "menus": {
+        "type": "boolean",
+        "description": (
+            "Only for action='capture'. Also list the app's menu bar (omitted by default; menus "
+            "you open from it only show up with this set)."
+        ),
+    },
     "window_id": {
         "type": "integer",
         "description": (
@@ -76,8 +83,8 @@ _PROPERTIES: dict[str, Any] = {
     "element": {
         "type": "integer",
         "description": (
-            "The 1-based SOM index returned by the last `capture(mode='som')` call. Strongly "
-            "preferred over raw coordinates."
+            "Element index N from the `[N]` rows of the last capture. Strongly preferred over raw "
+            "coordinates."
         ),
     },
     "coordinate": {
@@ -195,8 +202,9 @@ COMPUTER_USE_SCHEMA: dict[str, Any] = {
         "pixel coordinates, or delivery_mode='foreground' (briefly fronts the window; separate "
         "approval). Each result carries a `verdict` with the next step; follow it — never repeat "
         "confirmed input, and re-capture to verify an unverifiable one before retrying. Workflow: "
-        "action='capture' (mode='som' gives numbered element overlays), then click by `element` "
-        "index; re-capture after state-changing actions (or pass capture_after=true). Image "
+        "action='capture' lists elements as rows like `[12] Button Save (disabled)`; act with "
+        "element=12. Re-capture after state-changing actions (or pass capture_after=true, which "
+        "may list only the rows that changed). Image "
         "captures include a shareable `screenshot_path`; deliver it via the platform's MEDIA "
         "syntax when the user asks to see it — not for captures used only for control."
     ),

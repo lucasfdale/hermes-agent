@@ -8,6 +8,7 @@ from __future__ import annotations
 import atexit
 import base64
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -118,8 +119,10 @@ def _reset_screenshot_dedup(session_id: Optional[str] = None) -> None:
     with _screenshot_dedup_lock:
         if session_id is None:
             _last_screenshot_state.clear()
+            _last_rows_state.clear()
         else:
             _last_screenshot_state.pop(session_id, None)
+            _last_rows_state.pop(session_id, None)  # capture_after row diffs share the compaction boundary
 
 def reset_screenshot_dedup(session_id: str) -> None:
     """Compaction boundary hook (mirrors ``reset_file_dedup``): the summary may have dropped the frame an
@@ -440,7 +443,7 @@ def _do_capture(backend, action, args, fence=lambda: None, session_id=None, **_)
     # pid/window_id forwarded only when given so older backends keep their defaults.
     cap = backend.capture(mode=mode, app=args.get("app"), **{k: args[k] for k in ("pid", "window_id") if args.get(k) is not None})
     fence()
-    return _capture_response(cap, session_id=session_id)
+    return _capture_response(cap, session_id=session_id, include_menus=bool(args.get("menus")))
 
 def _do_listing(backend, action, args, key, **_):
     return json.dumps({key: (items := getattr(backend, action)()), "count": len(items)})
@@ -609,6 +612,90 @@ def _format_elements(elements: list[UIElement], max_lines: int = 40) -> list[str
            + (f" [{e.app}]" if e.app else "") for e in elements[:max_lines]]
     return out + ([f"  ... +{len(elements) - max_lines} more (call capture with app= to narrow)"] if len(elements) > max_lines else [])
 
+# ── Compact capture output (computer_use.compact_capture, default on; false = the legacy shape) ──
+# Legacy captures sent the element list twice (JSON `elements` + summary rows), with screen-space bounds the
+# model cannot use for coordinate= clicks (those are screenshot pixels), and the app's whole menu bar, Apple >
+# Recent Items included. Compact captures send one row per element, `[12] Button Save (disabled)`, skip the
+# menu bar unless capture(menus=true), and never list recent-file submenus (both modes).
+_MENU_BAR_ROLE = "AXMenuBar"
+_MENU_ROLES = frozenset({"AXMenuBar", "AXMenuBarItem", "AXMenu", "AXMenuItem"})
+# Submenus that list recently opened file names (Apple menu, File > Open Recent): their children never reach the model.
+_PRIVATE_SUBMENU_LABELS = frozenset({"recent items", "open recent"})
+
+def _compact_capture_enabled() -> bool:
+    with contextlib.suppress(Exception):
+        from hermes_cli.config import load_config_readonly
+        return bool(((load_config_readonly() or {}).get("computer_use") or {}).get("compact_capture", True))
+    return True
+
+def _filter_capture_elements(elements: list[UIElement], drop_menu_bar: bool) -> tuple[list[UIElement], int]:
+    """``(kept, menu_bar_count)``. Children of recent-file submenus are always dropped; the menu-bar subtree
+    only when ``drop_menu_bar``. Uses the driver's ``parent_index``; without it (markdown fallback), the menu
+    rows that follow an AXMenuBar row in walk order count as its subtree. Indices are never renumbered."""
+    by_index = {e.index: e for e in elements}
+
+    def chain(e: UIElement) -> list[UIElement]:
+        out, seen, parent = [], set(), (e.attributes or {}).get("parent_index")
+        while isinstance(parent, int) and parent in by_index and parent not in seen:
+            seen.add(parent)
+            out.append(by_index[parent])
+            parent = (by_index[parent].attributes or {}).get("parent_index")
+        return out
+
+    kept: list[UIElement] = []
+    menu_count, in_flat_menu_bar = 0, False
+    for e in elements:
+        ancestors = chain(e)
+        if "parent_index" in (e.attributes or {}):
+            in_menu_bar = e.role == _MENU_BAR_ROLE or any(a.role == _MENU_BAR_ROLE for a in ancestors)
+        else:  # no tree info: AXMenuBar opens a run of menu rows, the first non-menu row closes it
+            in_flat_menu_bar = e.role == _MENU_BAR_ROLE or (in_flat_menu_bar and e.role in _MENU_ROLES)
+            in_menu_bar = in_flat_menu_bar
+        menu_count += in_menu_bar
+        if any(a.label.strip().lower() in _PRIVATE_SUBMENU_LABELS for a in ancestors) or (in_menu_bar and drop_menu_bar):
+            continue
+        kept.append(e)
+    return kept, menu_count
+
+def _compact_row(e: UIElement) -> str:
+    """``[12] Button Save value="3" (disabled, selected)``: index, role without the AX prefix, label, then value
+    and state only when present. No bounds: element= clicks need none, coordinate= reads the screenshot."""
+    attrs = e.attributes or {}
+    label = " ".join(e.label.split())
+    parts = [f"[{e.index}]", e.role.removeprefix("AX") or "?"]
+    if label:
+        parts.append(label[:_MAX_ELEMENT_LABEL_CHARS] + ("…" if len(label) > _MAX_ELEMENT_LABEL_CHARS else ""))
+    value = attrs.get("value")
+    if value not in (None, "") and str(value) != e.label:
+        parts.append("value=" + json.dumps(" ".join(str(value).split())[:60], ensure_ascii=False))
+    states = [name for name, on in (("disabled", attrs.get("enabled") is False), ("selected", attrs.get("selected") is True)) if on]
+    return " ".join(parts) + (f" ({', '.join(states)})" if states else "")
+
+# capture_after diff: per session, the rows of the last compact capture of a target. A capture_after follow-up of
+# the same target lists only the rows that changed when that is smaller; a streak cap (same as the screenshot
+# dedup) and the compaction reset re-send the full list before the reference could have been summarized away.
+_last_rows_state: dict[str, dict[str, Any]] = {}  # session_id -> {"target", "rows": {index: row}, "streak"}
+
+def _rows_diff(session_id: Optional[str], target: tuple[str, str], rows: dict[int, str],
+               diff_ok: bool) -> Optional[tuple[list[str], list[int]]]:
+    """``(changed_rows, removed_indices)`` when the caller may send only the change, else None. Always records
+    *rows* as the session's latest list."""
+    if not session_id:
+        return None
+    with _screenshot_dedup_lock:
+        sid = _scoped_sid(session_id)
+        prev = _last_rows_state.get(sid)
+        result = None
+        if diff_ok and prev and prev.get("target") == target and int(prev.get("streak", 0)) < _SCREENSHOT_DEDUP_MAX_STREAK:
+            old = prev.get("rows") or {}
+            changed = [row for index, row in rows.items() if old.get(index) != row]
+            removed = sorted(index for index in old if index not in rows)
+            if len(changed) + len(removed) < len(rows) / 2:
+                result = (changed, removed)
+        _last_rows_state[sid] = {"target": target, "rows": rows,
+                                 "streak": (int(prev.get("streak", 0)) + 1) if result is not None and prev else 0}
+        return result
+
 def _bounds_hints(elements: list[UIElement], image_width: int, image_height: int) -> tuple[Optional[float], Optional[str]]:
     """(scale, note) when element bounds live in a different coordinate space than the screenshot, else (None, None).
     On HiDPI displays AX bounds are native while the screenshot is downscaled, so coordinate= clicks read off the
@@ -633,14 +720,14 @@ def _bounds_hints(elements: list[UIElement], image_width: int, image_height: int
 _bounds_scale = lambda elements, image_width, image_height: _bounds_hints(elements, image_width, image_height)[0]
 _bounds_space_note = lambda elements, image_width, image_height: _bounds_hints(elements, image_width, image_height)[1]
 
-def _capture_view(cap: CaptureResult, max_elements: int) -> SimpleNamespace:
+def _capture_view(cap: CaptureResult, max_elements: int, compact: bool = False) -> SimpleNamespace:
     """One capture's derived facts, computed once for every response branch: ``visible`` is the capped element list,
-    ``dims_omitted`` an image below the provider minimum."""
+    ``dims_omitted`` an image below the provider minimum. ``compact`` rows carry no bounds, so no bounds hints."""
     visible, dims = cap.elements[:max_elements], None
     with contextlib.suppress(Exception):  # (width, height) of the inline PNG/JPEG screenshot, else the backend's
         dims = image_dimensions_from_bytes(base64.b64decode(cap.png_b64, validate=False)) if cap.png_b64 else None
     width, height = dims or (cap.width, cap.height)
-    scale, note = _bounds_hints(visible, width, height)
+    scale, note = (None, None) if compact else _bounds_hints(visible, width, height)
     # Capped labels / capped element array: spill the complete tree for on-demand reads.
     lost_detail = len(cap.elements) > len(visible) or any(len(e.label) > _MAX_ELEMENT_LABEL_CHARS for e in visible)
     too_small = bool(dims) and min(dims) < _MIN_PROVIDER_IMAGE_DIMENSION
@@ -653,37 +740,57 @@ def _capture_view(cap: CaptureResult, max_elements: int) -> SimpleNamespace:
                            ax_capped=cap.ax_max_elements if ax_capped else 0,
                            elements_file=_spill_elements_to_file(cap) if lost_detail else None,
                            screenshot_path=_persist_capture_image(cap) if has_image else None,
-                           dims_omitted=dims if too_small else None, has_image=has_image)
+                           dims_omitted=dims if too_small else None, has_image=has_image, compact=compact,
+                           menu_omitted=0, rows_diff=None)
+
+def _compact_element_lines(v: SimpleNamespace) -> tuple[list[str], list[str]]:
+    """``(notes, rows)`` for a compact capture: every visible element as one row, or only the changed rows when
+    ``v.rows_diff`` is set (capture_after of an unchanged target)."""
+    notes: list[str] = []
+    if v.menu_omitted:
+        notes.append(f"app menu bar omitted ({v.menu_omitted} elements); capture(menus=true) lists it")
+    if v.rows_diff is None:
+        return notes, [f"  {_compact_row(e)}" for e in v.visible]
+    changed, removed = v.rows_diff
+    notes.append(f"only rows that changed since the previous capture of this window are listed ({len(changed)} changed, "
+                 f"{len(removed)} gone); every other row and index from that capture still applies")
+    return notes, [f"  {row}" for row in changed] + ([f"  (gone: {', '.join(f'[{i}]' for i in removed)})"] if removed else [])
 
 def _capture_summary_lines(v: SimpleNamespace) -> list[str]:
     """Human-readable capture summary; line ORDER is contract. Lists only what `elements` surfaces, otherwise the
     summary names indices the model can't find."""
+    compact = getattr(v, "compact", False)
+    compact_notes, compact_rows = _compact_element_lines(v) if compact else ([], [])
     notes = (
         v.bounds_note and v.bounds_note + (f"; estimated scale ~{v.bounds_scale}x (screenshot position x "
                                            f"{v.bounds_scale} ≈ native coordinate)" if v.bounds_scale else ""),
         v.screenshot_path and f"shareable screenshot saved to {v.screenshot_path}",
         v.cap.note,
-        v.elements_file and (f"{'' if v.ax_capped else 'full '}element tree with untruncated labels "
+        v.elements_file and (compact and (f"first {len(v.visible)} of {v.total} listed; full list with untruncated labels in "
+                                          f"{v.elements_file} (read_file/search_files it)") or
+                             f"{'' if v.ax_capped else 'full '}element tree with untruncated labels "
                              f"saved to {v.elements_file} — read_file/search_files it if you need dropped label "
                              "text or elements beyond the cap"),
         v.ax_capped and (f"accessibility walk capped at {v.ax_capped} elements; pass app= to narrow"),
+        *compact_notes,
     )
     return [
         f"capture mode={v.cap.mode} {v.width}x{v.height}"
         + (f" app={v.cap.app}" if v.cap.app else "") + (f" window={v.cap.window_title!r}" if v.cap.window_title else ""),
         f"{v.total} interactable element(s):",
         *(f"  ({note})" for note in notes if note),
-        *_format_elements(v.visible),
+        *(compact_rows if compact else _format_elements(v.visible)),
         *([f"  (screenshot omitted: {v.dims_omitted[0]}x{v.dims_omitted[1]} is below the "
            f"{_MIN_PROVIDER_IMAGE_DIMENSION}x{_MIN_PROVIDER_IMAGE_DIMENSION} provider minimum)"] if v.dims_omitted else []),
     ]
 
 def _text_capture_payload(v: SimpleNamespace, summary: str, extra: Optional[dict[str, Any]] = None) -> str:
     """JSON text payload shared by the AX, vision-unavailable and aux-vision branches. Key order is contract:
-    fixed fields, ``extra`` branch markers, then set optionals."""
+    fixed fields, ``extra`` branch markers, then set optionals. Compact captures list elements once, in ``summary``."""
     return json.dumps({
         "mode": v.cap.mode, "width": v.width, "height": v.height, "app": v.cap.app, "window_title": v.cap.window_title,
-        "elements": [_element_to_dict(e) for e in v.visible], "total_elements": v.total, "summary": summary,
+        **({} if getattr(v, "compact", False) else {"elements": [_element_to_dict(e) for e in v.visible]}),
+        "total_elements": v.total, "summary": summary,
         **(extra or {}),
         **_present(truncated_elements=v.truncated, elements_file=v.elements_file, screenshot_path=v.screenshot_path,
                    bounds_scale=v.bounds_scale),
@@ -694,8 +801,16 @@ def _capture_digest(cap: CaptureResult) -> str:
                           + (cap.png_b64 or "").encode("ascii", "ignore")).hexdigest()
 
 def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS,
-                      session_id: Optional[str] = None) -> Any:
-    v = _capture_view(cap, max_elements)
+                      session_id: Optional[str] = None, include_menus: bool = False, diff_ok: bool = False) -> Any:
+    compact = _compact_capture_enabled()
+    kept, menu_count = _filter_capture_elements(cap.elements, drop_menu_bar=compact and not include_menus)
+    if len(kept) != len(cap.elements):  # filtered before anything (spill file included) sees the list
+        cap = dataclasses.replace(cap, elements=kept)
+    v = _capture_view(cap, max_elements, compact=compact)
+    if compact:
+        v.menu_omitted = 0 if include_menus else menu_count
+        v.rows_diff = _rows_diff(session_id, (str(cap.app or ""), str(cap.window_title or "")),
+                                 {e.index: _compact_row(e) for e in v.visible}, diff_ok)
     lines = _capture_summary_lines(v)
     summary, extra = "\n".join(lines), None  # multimodal/aux paths use this; text paths append notes and rebuild
     if v.has_image and session_id and _screenshot_dedup_check(
@@ -732,7 +847,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         lines.append("  (vision unavailable: the auxiliary vision model could not be reached; screenshot "
                      "omitted. Element-index actions still work — drive via the element list above.)")
         extra = {"vision_unavailable": True}
-    if v.truncated:  # text paths carry the `elements` array, so the truncation note applies
+    if v.truncated and not compact:  # legacy text paths carry the `elements` array, so the truncation note applies
         lines.append(f"  (response truncated to {len(v.visible)} of {v.total} elements; the full tree is in "
                      "elements_file — read_file/search_files it, or pass app= to narrow scope)")
     return _text_capture_payload(v, "\n".join(lines), extra)
@@ -752,7 +867,7 @@ def _maybe_follow_capture(backend: ComputerUseBackend, res: ActionResult, do_cap
         logger.warning("follow-up capture failed: %s", e)
         return _text_response(res)
     fence()  # a frame taken after a takeover never reaches the dedup cache nor the model
-    resp, payload = _capture_response(cap, session_id=session_id), _action_payload(res)
+    resp, payload = _capture_response(cap, session_id=session_id, diff_ok=True), _action_payload(res)
     if isinstance(resp, dict) and resp.get("_multimodal"):
         # Keep the evidence/verdict contract visible alongside the image — it governs whether input may repeat.
         resp["content"][0]["text"] = resp["text_summary"] = json.dumps(payload) + "\n\n" + resp["text_summary"]
@@ -960,7 +1075,8 @@ def _route_capture_through_aux_vision(cap: CaptureResult, summary: str, *, visib
     # exactly for non-vision main models. Dimensions are the backend's on this branch.
     view = SimpleNamespace(cap=cap, visible=cap.elements if visible_elements is None else visible_elements,
                            total=len(cap.elements), width=cap.width, height=cap.height, truncated=truncated_elements,
-                           elements_file=elements_file, screenshot_path=screenshot_path, bounds_scale=None)
+                           elements_file=elements_file, screenshot_path=screenshot_path, bounds_scale=None,
+                           compact=_compact_capture_enabled())
     return _text_capture_payload(view, summary, {"vision_analysis": analysis_text,
                                                  "vision_analysis_routed_via": "auxiliary.vision"})
 

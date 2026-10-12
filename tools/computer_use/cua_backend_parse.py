@@ -117,6 +117,9 @@ def _parse_elements_from_structured(raw_elements: list[dict[str, Any]]) -> list[
             bounds=bounds,
             # Opaque `s{snapshot_hex}:{index}` token — the driver owns parse + LRU semantics.
             element_token=token if isinstance(token, str) and token else None,
+            # Tree position + state for compact rows and menu-bar filtering (tool.py); absent keys are left out.
+            attributes={k: raw[k] for k in ("parent_index", "depth", "value", "enabled", "selected")
+                        if raw.get(k) is not None},
         ))
     return elements
 

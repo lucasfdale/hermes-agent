@@ -115,11 +115,11 @@ def _manifest_is_mode_independent(path: str) -> bool:
     return isinstance(version, int) and not isinstance(version, bool) and version >= 3
 
 def _computer_use_max_image_dimension() -> Optional[int]:
-    """``computer_use.max_image_dimension`` longest-edge cap (default 1456 = aux-vision downscale); ``0``/negative -> None."""
+    """``computer_use.max_image_dimension`` longest-edge cap (default 1024; was 1456 = aux-vision downscale); ``0``/negative -> None."""
     try:
-        dim = int(_computer_use_cfg().get("max_image_dimension", 1456))
+        dim = int(_computer_use_cfg().get("max_image_dimension", 1024))
     except (TypeError, ValueError):
-        dim = 1456
+        dim = 1024
     return dim if dim > 0 else None
 
 def desktop_identity(env: Optional[dict[str, str]] = None) -> str:
@@ -413,6 +413,11 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         if token and (self._session.supports_input_property(name, "element_token")
                       or self._session.supports_capability("accessibility.element_tokens", tool=name)):
             args["element_token"] = token
+            # cua-driver 0.34 dropped `element_index` from `click`'s schema and refuses unknown arguments
+            # ("click: unknown argument element_index"). Send the token alone when the live schema says so.
+            props = (getattr(self._session, "_tool_schemas", {}).get(name) or {}).get("properties")
+            if isinstance(props, dict) and "element_index" not in props:
+                args.pop("element_index", None)
         if inject_session:  # setdefault preserves any explicit session a caller already supplied
             args.setdefault("session", self._session_id)
         try:

@@ -13,6 +13,13 @@ import pytest
 import itertools
 
 
+@pytest.fixture(autouse=True)
+def _legacy_capture_shape(monkeypatch):
+    """These tests pin the legacy capture shape (JSON `elements` + `#N @ bounds` rows); the default compact
+    shape is covered in test_computer_use_compact_capture.py."""
+    monkeypatch.setattr("tools.computer_use.tool._compact_capture_enabled", lambda: False)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
